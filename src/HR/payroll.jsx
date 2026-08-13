@@ -17,6 +17,7 @@ import {
   Row,
   Col,
   Tooltip,
+  Alert,
 } from "antd";
 import {
   Calculator,
@@ -38,6 +39,9 @@ import {
   loadHrPayrollMonths,
   getMonthPaymentSummary,
   formatMonthCloseBlockMessage,
+  getEmployeePendingArrears,
+  isEmployeeActive,
+  buildBackPayRecordId,
 } from "./hrDataService";
 
 const { Title, Paragraph, Text } = Typography;
@@ -257,6 +261,13 @@ const HRPayroll = () => {
   const [auditModalVisible, setAuditModalVisible] = useState(false);
   const [auditEmployeeData, setAuditEmployeeData] = useState(null);
 
+  // Back pay modal state
+  const [backPayModalVisible, setBackPayModalVisible] = useState(false);
+  const [backPayWorkMonth, setBackPayWorkMonth] = useState(null);
+  const [backPayBasicSalary, setBackPayBasicSalary] = useState(0);
+  const [backPayTaxableAllowances, setBackPayTaxableAllowances] = useState(0);
+  const [backPayNonTaxableAllowances, setBackPayNonTaxableAllowances] = useState(0);
+
   // Helper function to append the next recurring month to the back of the queue ("1 down -> 1 added back")
   const appendNextRecurringMonth = () => {
     setMonthsList((prevMonths) => {
@@ -378,9 +389,31 @@ const HRPayroll = () => {
     [selectedMonth, employees, payrollRecords]
   );
 
+  const selectedEmployeeArrears = useMemo(() => {
+    if (!selectedEmployeeId) return [];
+    return getEmployeePendingArrears(selectedEmployeeId, payrollRecords, monthStatusMap);
+  }, [selectedEmployeeId, payrollRecords, monthStatusMap]);
+
+  const selectedEmployee = useMemo(
+    () => employees.find((emp) => emp.id === selectedEmployeeId) || null,
+    [employees, selectedEmployeeId]
+  );
+
+  const backPayMonthOptions = useMemo(
+    () =>
+      completedMonthKeys.map((monthKey) => ({
+        label: monthLabel(monthKey, useEthiopianCalendar),
+        value: monthKey,
+      })),
+    [completedMonthKeys, useEthiopianCalendar]
+  );
+
   const currentPayrollRecord = useMemo(() => {
     return payrollRecords.find(
-      (record) => record.monthKey === selectedMonth && record.employeeId === selectedEmployeeId
+      (record) =>
+        record.monthKey === selectedMonth &&
+        record.employeeId === selectedEmployeeId &&
+        record.recordType !== "arrears"
     );
   }, [payrollRecords, selectedMonth, selectedEmployeeId]);
 
@@ -424,7 +457,7 @@ const HRPayroll = () => {
 
     const employeeIdsWithRecord = new Set(activeRecords.map((record) => record.employeeId));
     const missingTotal = employees.reduce((sum, employee) => {
-      if (employeeIdsWithRecord.has(employee.id)) {
+      if (!isEmployeeActive(employee) || employeeIdsWithRecord.has(employee.id)) {
         return sum;
       }
       const calculations = calculatePayroll({
@@ -438,7 +471,11 @@ const HRPayroll = () => {
     return recordTotal + missingTotal;
   }, [activeMonthKey, payrollRecords, employees]);
 
-  const currentMonthRecords = payrollRecords.filter((record) => record.monthKey === selectedMonth);
+  const currentMonthRecords = payrollRecords.filter(
+    (record) =>
+      (record.monthKey === selectedMonth && record.recordType !== "arrears") ||
+      (record.recordType === "arrears" && record.paidInMonthKey === selectedMonth)
+  );
   const selectedMonthPayrollRows = currentMonthRecords.map((record) => {
     const employee = employees.find((emp) => emp.id === record.employeeId) || {};
     const calculations = calculatePayroll({
@@ -446,10 +483,14 @@ const HRPayroll = () => {
       taxableAllowances: record.taxableAllowances || 0,
       nonTaxableAllowances: record.nonTaxableAllowances || 0,
     });
+    const workMonth = record.workMonthKey || record.monthKey;
     return {
       id: record.id,
       employeeId: record.employeeId,
       employeeName: employee.name || "Unknown Employee",
+      employeeStatus: employee.status || "Unknown",
+      isArrears: record.recordType === "arrears",
+      workMonthKey: workMonth,
       basicSalaryVal: record.basicSalary || 0,
       taxableAllowancesVal: record.taxableAllowances || 0,
       nonTaxableAllowancesVal: record.nonTaxableAllowances || 0,
@@ -470,7 +511,20 @@ const HRPayroll = () => {
   };
 
   const payrollTableColumns = [
-    { title: "Employee", dataIndex: "employeeName", key: "employeeName", render: (text) => <Text bold>{text}</Text> },
+    {
+      title: "Employee",
+      dataIndex: "employeeName",
+      key: "employeeName",
+      render: (text, record) => (
+        <Space size={4} wrap>
+          <Text bold>{text}</Text>
+          {!isEmployeeActive({ status: record.employeeStatus }) && <Tag color="default">Inactive</Tag>}
+          {record.isArrears && (
+            <Tag color="purple">Back pay · {monthLabel(record.workMonthKey, useEthiopianCalendar)}</Tag>
+          )}
+        </Space>
+      ),
+    },
     { title: "Gross Income", dataIndex: "gross", key: "gross" },
     { title: "Taxable Base", dataIndex: "taxable", key: "taxable" },
     { title: "Emp. Pension (7%)", dataIndex: "employeePension", key: "employeePension" },
@@ -663,9 +717,93 @@ const HRPayroll = () => {
   };
 
   const employeeOptions = employees.map((employee) => ({
-    label: `${employee.name} (${employee.role || employee.title || "Staff"})`,
+    label: `${employee.name} (${employee.role || employee.title || "Staff"})${
+      !isEmployeeActive(employee) ? " · Inactive" : ""
+    }`,
     value: employee.id,
   }));
+
+  const openBackPayModal = (workMonthKey = null) => {
+    if (!selectedEmployeeId) {
+      message.error("Select an employee first.");
+      return;
+    }
+
+    const targetWorkMonth = workMonthKey || selectedEmployeeArrears[0]?.monthKey || completedMonthKeys[0];
+    if (!targetWorkMonth) {
+      message.error("No closed payroll months available for back pay.");
+      return;
+    }
+
+    const existingRecord = payrollRecords.find(
+      (record) =>
+        record.employeeId === selectedEmployeeId &&
+        (record.workMonthKey || record.monthKey) === targetWorkMonth &&
+        (record.status || "Pending") !== "Paid"
+    );
+    const defaultSalary = selectedEmployee?.defaultSalary ?? selectedEmployee?.basicSalary ?? 0;
+
+    setBackPayWorkMonth(targetWorkMonth);
+    setBackPayBasicSalary(existingRecord?.basicSalary ?? defaultSalary);
+    setBackPayTaxableAllowances(existingRecord?.taxableAllowances || 0);
+    setBackPayNonTaxableAllowances(existingRecord?.nonTaxableAllowances || 0);
+    setBackPayModalVisible(true);
+  };
+
+  const saveBackPayRecord = async () => {
+    if (!selectedEmployeeId || !backPayWorkMonth) {
+      message.error("Select an employee and work month for back pay.");
+      return;
+    }
+
+    const existingRecord = payrollRecords.find(
+      (record) =>
+        record.employeeId === selectedEmployeeId &&
+        (record.workMonthKey || record.monthKey) === backPayWorkMonth
+    );
+    const recordId = existingRecord?.id || buildBackPayRecordId(selectedEmployeeId, backPayWorkMonth);
+    const now = new Date();
+
+    setSaving(true);
+    try {
+      const payload = {
+        employeeId: selectedEmployeeId,
+        monthKey: backPayWorkMonth,
+        workMonthKey: backPayWorkMonth,
+        paidInMonthKey: activeMonthKey,
+        recordType: "arrears",
+        basicSalary: Number(backPayBasicSalary) || 0,
+        taxableAllowances: Number(backPayTaxableAllowances) || 0,
+        nonTaxableAllowances: Number(backPayNonTaxableAllowances) || 0,
+        status: "Paid",
+        updatedAt: now,
+      };
+
+      await setDoc(
+        doc(db, "Payroll", recordId),
+        { ...payload, updatedAt: serverTimestamp() },
+        { merge: true }
+      );
+
+      setPayrollRecords((current) => {
+        const existingIndex = current.findIndex((record) => record.id === recordId);
+        if (existingIndex >= 0) {
+          return current.map((record) => (record.id === recordId ? { ...record, ...payload, id: recordId, key: recordId } : record));
+        }
+        return [...current, { ...payload, id: recordId, key: recordId }];
+      });
+
+      setBackPayModalVisible(false);
+      message.success(
+        `Back pay recorded for ${monthLabel(backPayWorkMonth, useEthiopianCalendar)} in ${monthLabel(activeMonthKey, useEthiopianCalendar)}.`
+      );
+    } catch (error) {
+      console.error("Error saving back pay record:", error);
+      message.error("Could not save back pay record.");
+    } finally {
+      setSaving(false);
+    }
+  };
 
   const totalPayrollAmountLabel = `${activeMonthPayrollTotal.toLocaleString(undefined, { minimumFractionDigits: 2 })} ETB`;
   const selectedMonthLabel = monthLabel(selectedMonth, useEthiopianCalendar);
@@ -690,6 +828,27 @@ const HRPayroll = () => {
             </Tag>
           </Space>
         </div>
+
+        {selectedEmployeeArrears.length > 0 && selectedEmployee && (
+          <Alert
+            type="warning"
+            showIcon
+            message={`${selectedEmployee.name} has unpaid salary from closed month(s)`}
+            description={
+              <Space direction="vertical" size={8}>
+                <Text>
+                  Pending:{" "}
+                  {selectedEmployeeArrears
+                    .map((record) => monthLabel(record.workMonthKey || record.monthKey, useEthiopianCalendar))
+                    .join(", ")}
+                </Text>
+                <Button type="primary" size="small" onClick={() => openBackPayModal()}>
+                  Record Back Pay
+                </Button>
+              </Space>
+            }
+          />
+        )}
 
         {/* Selected Month Summary Card */}
         <Card bordered={false} style={{ boxShadow: "0 1px 3px rgba(0,0,0,0.1)", borderRadius: 12 }}>
@@ -717,7 +876,10 @@ const HRPayroll = () => {
                   />
                   {!isSelectedMonthCompleted && (
                     <Text type={selectedMonthSummary.canCloseMonth ? "success" : "warning"}>
-                      {selectedMonthSummary.paidCount}/{selectedMonthSummary.totalCount} employees paid
+                      {selectedMonthSummary.paidCount}/{selectedMonthSummary.totalCount} required employees paid
+                      {selectedMonthSummary.inactiveBlockingCount > 0
+                        ? ` (${selectedMonthSummary.inactiveBlockingCount} inactive with open entries)`
+                        : ""}
                     </Text>
                   )}
                 </div>
@@ -986,16 +1148,21 @@ const HRPayroll = () => {
             <Divider style={{ margin: "8px 0" }} />
 
             {/* Action Buttons */}
-            <Space style={{ width: "100%", justifyContent: "space-between" }}>
-              <Button
-                type="primary"
-                size="large"
-                onClick={savePayrollRecord}
-                loading={saving}
-                disabled={isSelectedMonthCompleted}
-              >
-                Save Payroll Record
-              </Button>
+            <Space style={{ width: "100%", justifyContent: "space-between", flexWrap: "wrap" }}>
+              <Space wrap>
+                <Button
+                  type="primary"
+                  size="large"
+                  onClick={savePayrollRecord}
+                  loading={saving}
+                  disabled={isSelectedMonthCompleted}
+                >
+                  Save Payroll Record
+                </Button>
+                <Button size="large" onClick={() => openBackPayModal()} disabled={completedMonthKeys.length === 0}>
+                  Record Back Pay
+                </Button>
+              </Space>
               <Tooltip
                 title={
                   !selectedMonthSummary.canCloseMonth && isSelectedMonthActive
@@ -1090,6 +1257,78 @@ const HRPayroll = () => {
             </Card>
           </div>
         )}
+      </Modal>
+
+      <Modal
+        title={
+          <Space>
+            <Clock color="#1677ff" />
+            <span>Record Back Pay — {selectedEmployee?.name || "Employee"}</span>
+          </Space>
+        }
+        open={backPayModalVisible}
+        onCancel={() => setBackPayModalVisible(false)}
+        onOk={saveBackPayRecord}
+        okText="Save Back Pay as Paid"
+        confirmLoading={saving}
+        width={720}
+      >
+        <Space direction="vertical" size="middle" style={{ width: "100%", marginTop: 8 }}>
+          <Alert
+            type="info"
+            showIcon
+            message="Back pay settles salary for a closed work month without reopening that period."
+            description={`Payment will be recorded in the current open month (${monthLabel(activeMonthKey, useEthiopianCalendar)}).`}
+          />
+          <Row gutter={[16, 16]}>
+            <Col xs={24} md={12}>
+              <label style={{ display: "block", marginBottom: 6, fontWeight: 600 }}>Work Month (closed)</label>
+              <Select
+                style={{ width: "100%" }}
+                value={backPayWorkMonth}
+                onChange={setBackPayWorkMonth}
+                options={backPayMonthOptions}
+                placeholder="Select closed month"
+              />
+            </Col>
+            <Col xs={24} md={12}>
+              <label style={{ display: "block", marginBottom: 6, fontWeight: 600 }}>Paid In (current month)</label>
+              <Select
+                style={{ width: "100%" }}
+                value={activeMonthKey}
+                disabled
+                options={[{ label: monthLabel(activeMonthKey, useEthiopianCalendar), value: activeMonthKey }]}
+              />
+            </Col>
+            <Col xs={24} md={8}>
+              <label style={{ display: "block", marginBottom: 6, fontWeight: 600 }}>Basic Salary (ETB)</label>
+              <InputNumber
+                min={0}
+                value={backPayBasicSalary}
+                style={{ width: "100%" }}
+                onChange={(value) => setBackPayBasicSalary(Number(value) || 0)}
+              />
+            </Col>
+            <Col xs={24} md={8}>
+              <label style={{ display: "block", marginBottom: 6, fontWeight: 600 }}>Taxable Allowances</label>
+              <InputNumber
+                min={0}
+                value={backPayTaxableAllowances}
+                style={{ width: "100%" }}
+                onChange={(value) => setBackPayTaxableAllowances(Number(value) || 0)}
+              />
+            </Col>
+            <Col xs={24} md={8}>
+              <label style={{ display: "block", marginBottom: 6, fontWeight: 600 }}>Non-Taxable Allowances</label>
+              <InputNumber
+                min={0}
+                value={backPayNonTaxableAllowances}
+                style={{ width: "100%" }}
+                onChange={(value) => setBackPayNonTaxableAllowances(Number(value) || 0)}
+              />
+            </Col>
+          </Row>
+        </Space>
       </Modal>
     </div>
   );
