@@ -212,3 +212,43 @@ export const loadHrPayrollMonths = async () => {
     normalizeMonth
   );
 };
+
+export const getMonthPaymentSummary = (monthKey, employees, payrollRecords) => {
+  const monthRecords = payrollRecords.filter((record) => record.monthKey === monthKey);
+  const recordByEmployee = Object.fromEntries(monthRecords.map((record) => [record.employeeId, record]));
+
+  const unpaid = [];
+  const missing = [];
+
+  for (const employee of employees) {
+    const record = recordByEmployee[employee.id];
+
+    if (!record) {
+      missing.push(employee);
+      continue;
+    }
+
+    if ((record.status || "Pending") !== "Paid") {
+      unpaid.push({ employee, record });
+    }
+  }
+
+  const paidCount = employees.length - unpaid.length - missing.length;
+
+  return {
+    canCloseMonth: unpaid.length === 0 && missing.length === 0 && employees.length > 0,
+    unpaid,
+    missing,
+    paidCount,
+    totalCount: employees.length,
+  };
+};
+
+export const formatMonthCloseBlockMessage = (summary) => {
+  const remaining = [
+    ...summary.missing.map((employee) => `${employee.name} (no payroll record)`),
+    ...summary.unpaid.map(({ employee, record }) => `${employee.name} (${record.status || "Pending"})`),
+  ];
+
+  return `Cannot close month: ${summary.paidCount}/${summary.totalCount} employees paid. Remaining: ${remaining.join(", ")}`;
+};

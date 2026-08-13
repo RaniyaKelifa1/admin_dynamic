@@ -32,7 +32,13 @@ import {
 } from "lucide-react";
 import { doc, serverTimestamp, setDoc } from "firebase/firestore";
 import { db } from "../Sales/Components/firebase";
-import { loadHrEmployees, loadHrPayrollRecords, loadHrPayrollMonths } from "./hrDataService";
+import {
+  loadHrEmployees,
+  loadHrPayrollRecords,
+  loadHrPayrollMonths,
+  getMonthPaymentSummary,
+  formatMonthCloseBlockMessage,
+} from "./hrDataService";
 
 const { Title, Paragraph, Text } = Typography;
 
@@ -367,6 +373,11 @@ const HRPayroll = () => {
     [months, monthStatusMap]
   );
 
+  const selectedMonthSummary = useMemo(
+    () => getMonthPaymentSummary(selectedMonth, employees, payrollRecords),
+    [selectedMonth, employees, payrollRecords]
+  );
+
   const currentPayrollRecord = useMemo(() => {
     return payrollRecords.find(
       (record) => record.monthKey === selectedMonth && record.employeeId === selectedEmployeeId
@@ -571,6 +582,11 @@ const HRPayroll = () => {
     }
     if (!selectedMonth) return;
 
+    if (!selectedMonthSummary.canCloseMonth) {
+      message.error(formatMonthCloseBlockMessage(selectedMonthSummary));
+      return;
+    }
+
     setSaving(true);
     try {
       const completedAt = new Date();
@@ -606,6 +622,15 @@ const HRPayroll = () => {
 
   const updateMonthStatus = async (newStatus) => {
     if (!selectedMonth) return;
+
+    if (newStatus === "Paid") {
+      const summary = getMonthPaymentSummary(selectedMonth, employees, payrollRecords);
+      if (!summary.canCloseMonth) {
+        message.error(formatMonthCloseBlockMessage(summary));
+        return;
+      }
+    }
+
     setSaving(true);
     try {
       const updatedAt = new Date();
@@ -675,7 +700,7 @@ const HRPayroll = () => {
                   {selectedMonthLabel}
                 </Title>
                 <Text type="secondary">Current active payroll period</Text>
-                <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 10 }}>
+                <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
                   <Text type="secondary">Month Status:</Text>
                   <Select
                     value={selectedMonthStatus}
@@ -683,11 +708,18 @@ const HRPayroll = () => {
                     options={[
                       { label: "Pending", value: "Pending" },
                       { label: "Processing", value: "Processing" },
-                      { label: "Paid", value: "Paid" },
+                      ...(selectedMonthStatus === "Paid"
+                        ? [{ label: "Paid", value: "Paid" }]
+                        : []),
                     ]}
                     style={{ width: 150 }}
-                    disabled={saving}
+                    disabled={saving || isSelectedMonthCompleted}
                   />
+                  {!isSelectedMonthCompleted && (
+                    <Text type={selectedMonthSummary.canCloseMonth ? "success" : "warning"}>
+                      {selectedMonthSummary.paidCount}/{selectedMonthSummary.totalCount} employees paid
+                    </Text>
+                  )}
                 </div>
               </div>
               <div style={{ textAlign: "right", background: "#f1f5f9", padding: "16px 24px", borderRadius: 12 }}>
@@ -964,15 +996,23 @@ const HRPayroll = () => {
               >
                 Save Payroll Record
               </Button>
-              <Button
-                type="primary"
-                danger
-                size="large"
-                onClick={markMonthCompleted}
-                disabled={!isSelectedMonthActive}
+              <Tooltip
+                title={
+                  !selectedMonthSummary.canCloseMonth && isSelectedMonthActive
+                    ? formatMonthCloseBlockMessage(selectedMonthSummary)
+                    : null
+                }
               >
-                Close & Mark Month as Paid
-              </Button>
+                <Button
+                  type="primary"
+                  danger
+                  size="large"
+                  onClick={markMonthCompleted}
+                  disabled={!isSelectedMonthActive || !selectedMonthSummary.canCloseMonth}
+                >
+                  Close & Mark Month as Paid
+                </Button>
+              </Tooltip>
             </Space>
           </Space>
         </Card>
