@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { Row, Col, Card, Typography, Statistic, List, Tag, Spin } from "antd";
-import { calculatePayroll } from "./payrollService";
+import { resolvePayrollWithTax } from "./payrollService";
 import { loadHrDepartments, loadHrEmployees, loadHrPayrollMonths, loadHrPayrollRecords } from "./hrDataService";
 
 const { Title, Paragraph } = Typography;
@@ -50,10 +50,12 @@ const HRDashboard = () => {
 
         const monthPayrollRecords = payrollRecords.filter((record) => record.monthKey === activeMonthKey);
         const payrollTotal = monthPayrollRecords.reduce((sum, record) => {
-          const calculations = calculatePayroll({
+          const calculations = resolvePayrollWithTax({
             basicSalary: record.basicSalary || 0,
             taxableAllowances: record.taxableAllowances || 0,
             nonTaxableAllowances: record.nonTaxableAllowances || 0,
+            incomeTaxManual: record.incomeTaxManual,
+            incomeTaxOverride: record.incomeTaxOverride,
           });
           return sum + calculations.netSalary;
         }, 0);
@@ -101,10 +103,12 @@ const HRDashboard = () => {
         const monthPayrollTrend = fixedMonthKeys.map((monthKey) => {
           const records = payrollRecords.filter((record) => record.monthKey === monthKey);
           const total = records.reduce((sum, record) => {
-            const calculations = calculatePayroll({
+            const calculations = resolvePayrollWithTax({
               basicSalary: record.basicSalary || 0,
               taxableAllowances: record.taxableAllowances || 0,
               nonTaxableAllowances: record.nonTaxableAllowances || 0,
+              incomeTaxManual: record.incomeTaxManual,
+              incomeTaxOverride: record.incomeTaxOverride,
             });
             return sum + calculations.netSalary;
           }, 0);

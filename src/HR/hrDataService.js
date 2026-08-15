@@ -179,6 +179,7 @@ export const loadHrDepartments = async () => {
 
 export const loadHrPayrollRecords = async () => {
   const normalizePayroll = (docId, data = {}, collectionName) => ({
+    ...data,
     id: docId,
     key: docId,
     sourceCollection: collectionName,
@@ -191,7 +192,10 @@ export const loadHrPayrollRecords = async () => {
     recordType: data.recordType || "regular",
     workMonthKey: data.workMonthKey || data.monthKey || data.period || data.month || "",
     paidInMonthKey: data.paidInMonthKey || "",
-    ...data,
+    incomeTaxManual: Boolean(data.incomeTaxManual),
+    incomeTaxOverride: data.incomeTaxOverride ?? null,
+    incomeTax: data.incomeTax ?? null,
+    calculatedIncomeTax: data.calculatedIncomeTax ?? null,
   });
 
   return loadRecordsFromCollections(
