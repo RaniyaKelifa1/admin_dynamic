@@ -7,6 +7,12 @@
 
 const roundToTwo = (value) => Math.round((value + Number.EPSILON) * 100) / 100;
 
+/** No income tax when basic salary is below this amount. */
+export const INCOME_TAX_EXEMPTION_THRESHOLD = 4000;
+
+export const isIncomeTaxExempt = (basicSalary) =>
+  (Number(basicSalary) || 0) < INCOME_TAX_EXEMPTION_THRESHOLD;
+
 export const calculatePension = (basicSalary) => {
   const employeePension = roundToTwo(basicSalary * 0.07);
   const employerPension = roundToTwo(basicSalary * 0.11);
@@ -42,7 +48,8 @@ export const calculatePayroll = ({ basicSalary, taxableAllowances, nonTaxableAll
   const grossIncome = roundToTwo(normalizedBasic + normalizedTaxable + normalizedNonTaxable);
   const taxableIncome = roundToTwo(normalizedBasic + normalizedTaxable);
   const { employeePension, employerPension } = calculatePension(normalizedBasic);
-  const incomeTax = calculateIncomeTax(taxableIncome);
+  const calculatedIncomeTax = isIncomeTaxExempt(normalizedBasic) ? 0 : calculateIncomeTax(taxableIncome);
+  const incomeTax = calculatedIncomeTax;
   const netSalary = roundToTwo(grossIncome - employeePension - incomeTax);
 
   return {
@@ -50,7 +57,31 @@ export const calculatePayroll = ({ basicSalary, taxableAllowances, nonTaxableAll
     taxableIncome,
     employeePension,
     employerPension,
+    calculatedIncomeTax,
     incomeTax,
+    netSalary,
+  };
+};
+
+export const resolvePayrollWithTax = ({
+  basicSalary,
+  taxableAllowances,
+  nonTaxableAllowances,
+  incomeTaxManual = false,
+  incomeTaxOverride,
+}) => {
+  const base = calculatePayroll({ basicSalary, taxableAllowances, nonTaxableAllowances });
+  const manual = Boolean(incomeTaxManual);
+  const incomeTax = manual
+    ? roundToTwo(Math.max(0, Number(incomeTaxOverride) || 0))
+    : base.calculatedIncomeTax;
+  const netSalary = roundToTwo(base.grossIncome - base.employeePension - incomeTax);
+
+  return {
+    ...base,
+    incomeTax,
+    incomeTaxManual: manual,
+    incomeTaxOverride: manual ? incomeTax : null,
     netSalary,
   };
 };

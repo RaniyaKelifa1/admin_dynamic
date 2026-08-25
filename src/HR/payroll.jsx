@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState, useRef, useCallback } from "react";
 import {
   Card,
   Typography,
@@ -17,6 +17,7 @@ import {
   Row,
   Col,
   Tooltip,
+  Alert,
 } from "antd";
 import {
   Calculator,
@@ -32,7 +33,17 @@ import {
 } from "lucide-react";
 import { doc, serverTimestamp, setDoc } from "firebase/firestore";
 import { db } from "../Sales/Components/firebase";
-import { loadHrEmployees, loadHrPayrollRecords, loadHrPayrollMonths } from "./hrDataService";
+import {
+  loadHrEmployees,
+  loadHrPayrollRecords,
+  loadHrPayrollMonths,
+  getMonthPaymentSummary,
+  formatMonthCloseBlockMessage,
+  getEmployeePendingArrears,
+  isEmployeeActive,
+  buildBackPayRecordId,
+} from "./hrDataService";
+import { INCOME_TAX_EXEMPTION_THRESHOLD, isIncomeTaxExempt } from "./payrollService";
 
 const { Title, Paragraph, Text } = Typography;
 
@@ -59,6 +70,30 @@ export const calculatePayroll = ({
 
   // 3. Taxable Income (Basic Salary + Taxable Allowances)
   const taxableIncome = basic + taxableAllow;
+
+  // No income tax when basic salary is below 4,000 ETB
+  if (isIncomeTaxExempt(basic)) {
+    const totalEmployeeDeductions = employeePension;
+    const netSalary = grossIncome - totalEmployeeDeductions;
+
+    return {
+      basicSalary: basic,
+      taxableAllowances: taxableAllow,
+      nonTaxableAllowances: nonTaxableAllow,
+      grossIncome,
+      taxableIncome,
+      employeePension,
+      employerPension,
+      totalPension,
+      taxRatePercent: 0,
+      taxDeduction: 0,
+      bracketLabel: `Basic salary below ${INCOME_TAX_EXEMPTION_THRESHOLD.toLocaleString()} ETB (Exempt)`,
+      incomeTax: 0,
+      calculatedIncomeTax: 0,
+      totalEmployeeDeductions,
+      netSalary,
+    };
+  }
 
   // 4. Ethiopian Monthly Personal Income Tax (PIT) Brackets
   let taxRate = 0;
@@ -115,11 +150,39 @@ export const calculatePayroll = ({
     taxRatePercent: taxRate * 100,
     taxDeduction,
     bracketLabel,
+    calculatedIncomeTax: incomeTax,
     incomeTax,
     totalEmployeeDeductions,
     netSalary,
   };
 };
+
+const applyIncomeTaxOverride = (base, incomeTaxManual, incomeTaxOverride) => {
+  const calculatedIncomeTax = base.calculatedIncomeTax ?? base.incomeTax;
+  const manual = Boolean(incomeTaxManual);
+  const incomeTax = manual ? Math.max(0, Number(incomeTaxOverride) || 0) : calculatedIncomeTax;
+  const netSalary = base.grossIncome - base.employeePension - incomeTax;
+
+  return {
+    ...base,
+    calculatedIncomeTax,
+    incomeTax,
+    incomeTaxManual: manual,
+    netSalary,
+    totalEmployeeDeductions: base.employeePension + incomeTax,
+  };
+};
+
+const payrollFromRecord = (record) =>
+  applyIncomeTaxOverride(
+    calculatePayroll({
+      basicSalary: record.basicSalary || 0,
+      taxableAllowances: record.taxableAllowances || 0,
+      nonTaxableAllowances: record.nonTaxableAllowances || 0,
+    }),
+    record.incomeTaxManual,
+    record.incomeTaxOverride
+  );
 
 const ethiopianMonthNames = [
   "Hamle",
@@ -243,6 +306,8 @@ const HRPayroll = () => {
   const [taxableAllowances, setTaxableAllowances] = useState(0);
   const [nonTaxableAllowances, setNonTaxableAllowances] = useState(0);
   const [status, setStatus] = useState("Pending");
+  const [incomeTaxManual, setIncomeTaxManual] = useState(false);
+  const [incomeTaxOverride, setIncomeTaxOverride] = useState(null);
   const [useEthiopianCalendar, setUseEthiopianCalendar] = useState(true);
   const [saving, setSaving] = useState(false);
   const [monthStatuses, setMonthStatuses] = useState([]);
@@ -250,6 +315,18 @@ const HRPayroll = () => {
   // Logic Audit Modal State
   const [auditModalVisible, setAuditModalVisible] = useState(false);
   const [auditEmployeeData, setAuditEmployeeData] = useState(null);
+
+  // Back pay modal state
+  const [backPayModalVisible, setBackPayModalVisible] = useState(false);
+  const [backPayWorkMonth, setBackPayWorkMonth] = useState(null);
+  const [backPayBasicSalary, setBackPayBasicSalary] = useState(0);
+  const [backPayTaxableAllowances, setBackPayTaxableAllowances] = useState(0);
+  const [backPayNonTaxableAllowances, setBackPayNonTaxableAllowances] = useState(0);
+  const [backPayIncomeTaxManual, setBackPayIncomeTaxManual] = useState(false);
+  const [backPayIncomeTaxOverride, setBackPayIncomeTaxOverride] = useState(null);
+  const [adjustingRecordId, setAdjustingRecordId] = useState(null);
+
+  const adjustmentFormRef = useRef(null);
 
   // Helper function to append the next recurring month to the back of the queue ("1 down -> 1 added back")
   const appendNextRecurringMonth = () => {
@@ -367,30 +444,93 @@ const HRPayroll = () => {
     [months, monthStatusMap]
   );
 
+  const selectedMonthSummary = useMemo(
+    () => getMonthPaymentSummary(selectedMonth, employees, payrollRecords),
+    [selectedMonth, employees, payrollRecords]
+  );
+
+  const selectedEmployeeArrears = useMemo(() => {
+    if (!selectedEmployeeId) return [];
+    return getEmployeePendingArrears(selectedEmployeeId, payrollRecords, monthStatusMap);
+  }, [selectedEmployeeId, payrollRecords, monthStatusMap]);
+
+  const selectedEmployee = useMemo(
+    () => employees.find((emp) => emp.id === selectedEmployeeId) || null,
+    [employees, selectedEmployeeId]
+  );
+
+  const backPayMonthOptions = useMemo(
+    () =>
+      completedMonthKeys.map((monthKey) => ({
+        label: monthLabel(monthKey, useEthiopianCalendar),
+        value: monthKey,
+      })),
+    [completedMonthKeys, useEthiopianCalendar]
+  );
+
   const currentPayrollRecord = useMemo(() => {
+    if (adjustingRecordId) {
+      return payrollRecords.find((record) => record.id === adjustingRecordId) || null;
+    }
     return payrollRecords.find(
-      (record) => record.monthKey === selectedMonth && record.employeeId === selectedEmployeeId
+      (record) =>
+        record.monthKey === selectedMonth &&
+        record.employeeId === selectedEmployeeId &&
+        record.recordType !== "arrears"
     );
-  }, [payrollRecords, selectedMonth, selectedEmployeeId]);
+  }, [adjustingRecordId, payrollRecords, selectedMonth, selectedEmployeeId]);
 
-  useEffect(() => {
-    const employee = employees.find((emp) => emp.id === selectedEmployeeId);
-    const defaultSalary = employee?.defaultSalary ?? employee?.basicSalary ?? 0;
+  const loadPayrollRecordIntoForm = useCallback(
+    (record, employeeId) => {
+      const employee = employees.find((emp) => emp.id === employeeId);
+      const defaultSalary = employee?.defaultSalary ?? employee?.basicSalary ?? 0;
 
-    if (currentPayrollRecord) {
-      setBasicSalary(currentPayrollRecord.basicSalary ?? defaultSalary);
-      setTaxableAllowances(currentPayrollRecord.taxableAllowances || 0);
-      setNonTaxableAllowances(currentPayrollRecord.nonTaxableAllowances || 0);
-      setStatus(currentPayrollRecord.status || "Pending");
-    } else {
+      if (record) {
+        setBasicSalary(record.basicSalary ?? defaultSalary);
+        setTaxableAllowances(record.taxableAllowances || 0);
+        setNonTaxableAllowances(record.nonTaxableAllowances || 0);
+        setStatus(record.status || "Pending");
+        setIncomeTaxManual(Boolean(record.incomeTaxManual));
+        setIncomeTaxOverride(
+          record.incomeTaxManual
+            ? Number(record.incomeTaxOverride ?? record.incomeTax ?? 0)
+            : null
+        );
+        return;
+      }
+
       setBasicSalary(defaultSalary);
       setTaxableAllowances(0);
       setNonTaxableAllowances(0);
       setStatus("Pending");
-    }
-  }, [currentPayrollRecord, employees, selectedEmployeeId]);
+      setIncomeTaxManual(false);
+      setIncomeTaxOverride(null);
+    },
+    [employees]
+  );
 
-  const payrollInputs = useMemo(
+  useEffect(() => {
+    if (adjustingRecordId) return;
+    loadPayrollRecordIntoForm(currentPayrollRecord, selectedEmployeeId);
+  }, [adjustingRecordId, currentPayrollRecord, selectedEmployeeId, loadPayrollRecordIntoForm]);
+
+  useEffect(() => {
+    setAdjustingRecordId(null);
+  }, [selectedMonth]);
+
+  const handleAdjustRecord = (row) => {
+    const record = payrollRecords.find((item) => item.id === row.id);
+    setAdjustingRecordId(row.id);
+    setSelectedEmployeeId(row.employeeId);
+    loadPayrollRecordIntoForm(record, row.employeeId);
+
+    window.requestAnimationFrame(() => {
+      adjustmentFormRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+    message.success(`Adjusting payroll for ${row.employeeName}`);
+  };
+
+  const basePayrollCalc = useMemo(
     () =>
       calculatePayroll({
         basicSalary,
@@ -398,6 +538,26 @@ const HRPayroll = () => {
         nonTaxableAllowances,
       }),
     [basicSalary, taxableAllowances, nonTaxableAllowances]
+  );
+
+  const payrollInputs = useMemo(
+    () => applyIncomeTaxOverride(basePayrollCalc, incomeTaxManual, incomeTaxOverride),
+    [basePayrollCalc, incomeTaxManual, incomeTaxOverride]
+  );
+
+  const backPayBaseCalc = useMemo(
+    () =>
+      calculatePayroll({
+        basicSalary: backPayBasicSalary,
+        taxableAllowances: backPayTaxableAllowances,
+        nonTaxableAllowances: backPayNonTaxableAllowances,
+      }),
+    [backPayBasicSalary, backPayTaxableAllowances, backPayNonTaxableAllowances]
+  );
+
+  const backPayCalc = useMemo(
+    () => applyIncomeTaxOverride(backPayBaseCalc, backPayIncomeTaxManual, backPayIncomeTaxOverride),
+    [backPayBaseCalc, backPayIncomeTaxManual, backPayIncomeTaxOverride]
   );
 
   const activeMonthPayrollTotal = useMemo(() => {
@@ -413,7 +573,7 @@ const HRPayroll = () => {
 
     const employeeIdsWithRecord = new Set(activeRecords.map((record) => record.employeeId));
     const missingTotal = employees.reduce((sum, employee) => {
-      if (employeeIdsWithRecord.has(employee.id)) {
+      if (!isEmployeeActive(employee) || employeeIdsWithRecord.has(employee.id)) {
         return sum;
       }
       const calculations = calculatePayroll({
@@ -427,18 +587,23 @@ const HRPayroll = () => {
     return recordTotal + missingTotal;
   }, [activeMonthKey, payrollRecords, employees]);
 
-  const currentMonthRecords = payrollRecords.filter((record) => record.monthKey === selectedMonth);
+  const currentMonthRecords = payrollRecords.filter(
+    (record) =>
+      (record.monthKey === selectedMonth && record.recordType !== "arrears") ||
+      (record.recordType === "arrears" && record.paidInMonthKey === selectedMonth)
+  );
   const selectedMonthPayrollRows = currentMonthRecords.map((record) => {
     const employee = employees.find((emp) => emp.id === record.employeeId) || {};
-    const calculations = calculatePayroll({
-      basicSalary: record.basicSalary || 0,
-      taxableAllowances: record.taxableAllowances || 0,
-      nonTaxableAllowances: record.nonTaxableAllowances || 0,
-    });
+    const calculations = payrollFromRecord(record);
+    const workMonth = record.workMonthKey || record.monthKey;
     return {
       id: record.id,
       employeeId: record.employeeId,
       employeeName: employee.name || "Unknown Employee",
+      employeeStatus: employee.status || "Unknown",
+      isArrears: record.recordType === "arrears",
+      workMonthKey: workMonth,
+      incomeTaxManual: Boolean(record.incomeTaxManual),
       basicSalaryVal: record.basicSalary || 0,
       taxableAllowancesVal: record.taxableAllowances || 0,
       nonTaxableAllowancesVal: record.nonTaxableAllowances || 0,
@@ -459,12 +624,30 @@ const HRPayroll = () => {
   };
 
   const payrollTableColumns = [
-    { title: "Employee", dataIndex: "employeeName", key: "employeeName", render: (text) => <Text bold>{text}</Text> },
+    {
+      title: "Employee",
+      dataIndex: "employeeName",
+      key: "employeeName",
+      render: (text, record) => (
+        <Space size={4} wrap>
+          <Text bold>{text}</Text>
+          {!isEmployeeActive({ status: record.employeeStatus }) && <Tag color="default">Inactive</Tag>}
+          {record.isArrears && (
+            <Tag color="purple">Back pay · {monthLabel(record.workMonthKey, useEthiopianCalendar)}</Tag>
+          )}
+        </Space>
+      ),
+    },
     { title: "Gross Income", dataIndex: "gross", key: "gross" },
     { title: "Taxable Base", dataIndex: "taxable", key: "taxable" },
     { title: "Emp. Pension (7%)", dataIndex: "employeePension", key: "employeePension" },
     { title: "Empr. Pension (11%)", dataIndex: "employerPension", key: "employerPension" },
-    { title: "Income Tax", dataIndex: "incomeTax", key: "incomeTax" },
+    { title: "Income Tax", dataIndex: "incomeTax", key: "incomeTax", render: (text, record) => (
+      <Space size={4}>
+        <span>{text}</span>
+        {record.incomeTaxManual && <Tag color="orange">Adjusted</Tag>}
+      </Space>
+    ) },
     { title: "Net Salary", dataIndex: "netSalary", key: "netSalary", render: (text) => <Text style={{ color: '#1677ff', fontWeight: 'bold' }}>{text}</Text> },
     {
       title: "Status",
@@ -487,8 +670,7 @@ const HRPayroll = () => {
             ghost
             onClick={(e) => {
               e.stopPropagation();
-              setSelectedEmployeeId(record.employeeId);
-              message.info(`Selected ${record.employeeName} for adjustments.`);
+              handleAdjustRecord(record);
             }}
           >
             Adjust
@@ -520,18 +702,30 @@ const HRPayroll = () => {
 
     const newDefaultSalary = Number(basicSalary) || 0;
     const now = new Date();
-    const recordId = currentPayrollRecord?.id || `pay-${selectedEmployeeId}-${selectedMonth}`;
+    const editingRecord = currentPayrollRecord;
+    const recordId = editingRecord?.id || `pay-${selectedEmployeeId}-${selectedMonth}`;
 
     setSaving(true);
     try {
       const payload = {
         employeeId: selectedEmployeeId,
-        monthKey: selectedMonth,
+        monthKey: editingRecord?.monthKey || selectedMonth,
         basicSalary: newDefaultSalary,
         taxableAllowances: Number(taxableAllowances) || 0,
         nonTaxableAllowances: Number(nonTaxableAllowances) || 0,
+        incomeTaxManual,
+        incomeTaxOverride: incomeTaxManual ? Number(incomeTaxOverride) || 0 : null,
+        incomeTax: payrollInputs.incomeTax,
+        calculatedIncomeTax: payrollInputs.calculatedIncomeTax,
         status,
         updatedAt: now,
+        ...(editingRecord?.recordType === "arrears"
+          ? {
+              recordType: "arrears",
+              workMonthKey: editingRecord.workMonthKey || editingRecord.monthKey,
+              paidInMonthKey: editingRecord.paidInMonthKey || activeMonthKey,
+            }
+          : {}),
       };
 
       const firestorePayload = {
@@ -571,6 +765,11 @@ const HRPayroll = () => {
     }
     if (!selectedMonth) return;
 
+    if (!selectedMonthSummary.canCloseMonth) {
+      message.error(formatMonthCloseBlockMessage(selectedMonthSummary));
+      return;
+    }
+
     setSaving(true);
     try {
       const completedAt = new Date();
@@ -606,6 +805,15 @@ const HRPayroll = () => {
 
   const updateMonthStatus = async (newStatus) => {
     if (!selectedMonth) return;
+
+    if (newStatus === "Paid") {
+      const summary = getMonthPaymentSummary(selectedMonth, employees, payrollRecords);
+      if (!summary.canCloseMonth) {
+        message.error(formatMonthCloseBlockMessage(summary));
+        return;
+      }
+    }
+
     setSaving(true);
     try {
       const updatedAt = new Date();
@@ -638,9 +846,103 @@ const HRPayroll = () => {
   };
 
   const employeeOptions = employees.map((employee) => ({
-    label: `${employee.name} (${employee.role || employee.title || "Staff"})`,
+    label: `${employee.name} (${employee.role || employee.title || "Staff"})${
+      !isEmployeeActive(employee) ? " · Inactive" : ""
+    }`,
     value: employee.id,
   }));
+
+  const openBackPayModal = (workMonthKey = null) => {
+    if (!selectedEmployeeId) {
+      message.error("Select an employee first.");
+      return;
+    }
+
+    const targetWorkMonth = workMonthKey || selectedEmployeeArrears[0]?.monthKey || completedMonthKeys[0];
+    if (!targetWorkMonth) {
+      message.error("No closed payroll months available for back pay.");
+      return;
+    }
+
+    const existingRecord = payrollRecords.find(
+      (record) =>
+        record.employeeId === selectedEmployeeId &&
+        (record.workMonthKey || record.monthKey) === targetWorkMonth &&
+        (record.status || "Pending") !== "Paid"
+    );
+    const defaultSalary = selectedEmployee?.defaultSalary ?? selectedEmployee?.basicSalary ?? 0;
+
+    setBackPayWorkMonth(targetWorkMonth);
+    setBackPayBasicSalary(existingRecord?.basicSalary ?? defaultSalary);
+    setBackPayTaxableAllowances(existingRecord?.taxableAllowances || 0);
+    setBackPayNonTaxableAllowances(existingRecord?.nonTaxableAllowances || 0);
+    setBackPayIncomeTaxManual(Boolean(existingRecord?.incomeTaxManual));
+    setBackPayIncomeTaxOverride(
+      existingRecord?.incomeTaxManual
+        ? Number(existingRecord.incomeTaxOverride ?? existingRecord.incomeTax ?? 0)
+        : null
+    );
+    setBackPayModalVisible(true);
+  };
+
+  const saveBackPayRecord = async () => {
+    if (!selectedEmployeeId || !backPayWorkMonth) {
+      message.error("Select an employee and work month for back pay.");
+      return;
+    }
+
+    const existingRecord = payrollRecords.find(
+      (record) =>
+        record.employeeId === selectedEmployeeId &&
+        (record.workMonthKey || record.monthKey) === backPayWorkMonth
+    );
+    const recordId = existingRecord?.id || buildBackPayRecordId(selectedEmployeeId, backPayWorkMonth);
+    const now = new Date();
+
+    setSaving(true);
+    try {
+      const payload = {
+        employeeId: selectedEmployeeId,
+        monthKey: backPayWorkMonth,
+        workMonthKey: backPayWorkMonth,
+        paidInMonthKey: activeMonthKey,
+        recordType: "arrears",
+        basicSalary: Number(backPayBasicSalary) || 0,
+        taxableAllowances: Number(backPayTaxableAllowances) || 0,
+        nonTaxableAllowances: Number(backPayNonTaxableAllowances) || 0,
+        incomeTaxManual: backPayIncomeTaxManual,
+        incomeTaxOverride: backPayIncomeTaxManual ? Number(backPayIncomeTaxOverride) || 0 : null,
+        incomeTax: backPayCalc.incomeTax,
+        calculatedIncomeTax: backPayCalc.calculatedIncomeTax,
+        status: "Paid",
+        updatedAt: now,
+      };
+
+      await setDoc(
+        doc(db, "Payroll", recordId),
+        { ...payload, updatedAt: serverTimestamp() },
+        { merge: true }
+      );
+
+      setPayrollRecords((current) => {
+        const existingIndex = current.findIndex((record) => record.id === recordId);
+        if (existingIndex >= 0) {
+          return current.map((record) => (record.id === recordId ? { ...record, ...payload, id: recordId, key: recordId } : record));
+        }
+        return [...current, { ...payload, id: recordId, key: recordId }];
+      });
+
+      setBackPayModalVisible(false);
+      message.success(
+        `Back pay recorded for ${monthLabel(backPayWorkMonth, useEthiopianCalendar)} in ${monthLabel(activeMonthKey, useEthiopianCalendar)}.`
+      );
+    } catch (error) {
+      console.error("Error saving back pay record:", error);
+      message.error("Could not save back pay record.");
+    } finally {
+      setSaving(false);
+    }
+  };
 
   const totalPayrollAmountLabel = `${activeMonthPayrollTotal.toLocaleString(undefined, { minimumFractionDigits: 2 })} ETB`;
   const selectedMonthLabel = monthLabel(selectedMonth, useEthiopianCalendar);
@@ -666,6 +968,27 @@ const HRPayroll = () => {
           </Space>
         </div>
 
+        {selectedEmployeeArrears.length > 0 && selectedEmployee && (
+          <Alert
+            type="warning"
+            showIcon
+            message={`${selectedEmployee.name} has unpaid salary from closed month(s)`}
+            description={
+              <Space direction="vertical" size={8}>
+                <Text>
+                  Pending:{" "}
+                  {selectedEmployeeArrears
+                    .map((record) => monthLabel(record.workMonthKey || record.monthKey, useEthiopianCalendar))
+                    .join(", ")}
+                </Text>
+                <Button type="primary" size="small" onClick={() => openBackPayModal()}>
+                  Record Back Pay
+                </Button>
+              </Space>
+            }
+          />
+        )}
+
         {/* Selected Month Summary Card */}
         <Card bordered={false} style={{ boxShadow: "0 1px 3px rgba(0,0,0,0.1)", borderRadius: 12 }}>
           <Space direction="vertical" size="middle" style={{ width: "100%" }}>
@@ -675,7 +998,7 @@ const HRPayroll = () => {
                   {selectedMonthLabel}
                 </Title>
                 <Text type="secondary">Current active payroll period</Text>
-                <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 10 }}>
+                <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
                   <Text type="secondary">Month Status:</Text>
                   <Select
                     value={selectedMonthStatus}
@@ -683,11 +1006,21 @@ const HRPayroll = () => {
                     options={[
                       { label: "Pending", value: "Pending" },
                       { label: "Processing", value: "Processing" },
-                      { label: "Paid", value: "Paid" },
+                      ...(selectedMonthStatus === "Paid"
+                        ? [{ label: "Paid", value: "Paid" }]
+                        : []),
                     ]}
                     style={{ width: 150 }}
-                    disabled={saving}
+                    disabled={saving || isSelectedMonthCompleted}
                   />
+                  {!isSelectedMonthCompleted && (
+                    <Text type={selectedMonthSummary.canCloseMonth ? "success" : "warning"}>
+                      {selectedMonthSummary.paidCount}/{selectedMonthSummary.totalCount} required employees paid
+                      {selectedMonthSummary.inactiveBlockingCount > 0
+                        ? ` (${selectedMonthSummary.inactiveBlockingCount} inactive with open entries)`
+                        : ""}
+                    </Text>
+                  )}
                 </div>
               </div>
               <div style={{ textAlign: "right", background: "#f1f5f9", padding: "16px 24px", borderRadius: 12 }}>
@@ -797,11 +1130,19 @@ const HRPayroll = () => {
         )}
 
         {/* Payroll Employee Form Details & Live Computations */}
+        <div ref={adjustmentFormRef}>
         <Card
           title={
             <Space>
               <User size={18} />
-              <span>Employee Salary & Allowance Adjustments — {selectedMonthLabel}</span>
+              <span>
+                Employee Salary & Allowance Adjustments — {selectedMonthLabel}
+                {adjustingRecordId && currentPayrollRecord?.recordType === "arrears" && (
+                  <Tag color="purple" style={{ marginLeft: 8 }}>
+                    Back pay · {monthLabel(currentPayrollRecord.workMonthKey || currentPayrollRecord.monthKey, useEthiopianCalendar)}
+                  </Tag>
+                )}
+              </span>
             </Space>
           }
           bordered={false}
@@ -817,7 +1158,10 @@ const HRPayroll = () => {
                   style={{ width: "100%" }}
                   options={employeeOptions}
                   value={selectedEmployeeId}
-                  onChange={(value) => setSelectedEmployeeId(value)}
+                  onChange={(value) => {
+                    setAdjustingRecordId(null);
+                    setSelectedEmployeeId(value);
+                  }}
                   placeholder="Select employee"
                   disabled={isSelectedMonthCompleted}
                 />
@@ -874,6 +1218,55 @@ const HRPayroll = () => {
               </Col>
             </Row>
 
+            <Row gutter={[16, 16]} align="middle">
+              <Col xs={24} md={8}>
+                <Space direction="vertical" size={4} style={{ width: "100%" }}>
+                  <Space wrap>
+                    <Switch
+                      checked={incomeTaxManual}
+                      onChange={(checked) => {
+                        setIncomeTaxManual(checked);
+                        if (checked) {
+                          setIncomeTaxOverride(basePayrollCalc.calculatedIncomeTax ?? basePayrollCalc.incomeTax);
+                        } else {
+                          setIncomeTaxOverride(null);
+                        }
+                      }}
+                      disabled={isSelectedMonthCompleted}
+                    />
+                    <Text strong>Company-adjusted income tax</Text>
+                  </Space>
+                  <Text type="secondary">
+                    Calculated: {(basePayrollCalc.calculatedIncomeTax ?? basePayrollCalc.incomeTax).toLocaleString(undefined, { minimumFractionDigits: 2 })} ETB
+                  </Text>
+                </Space>
+              </Col>
+              <Col xs={24} md={6}>
+                <label style={{ display: "block", marginBottom: 6, fontWeight: 600 }}>Income Tax (ETB)</label>
+                <InputNumber
+                  min={0}
+                  value={incomeTaxManual ? incomeTaxOverride : payrollInputs.incomeTax}
+                  style={{ width: "100%" }}
+                  formatter={(value) => `${value}`.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}
+                  parser={(value) => value.replace(/\$\s?|(,*)/g, "")}
+                  onChange={(value) => setIncomeTaxOverride(Number(value) || 0)}
+                  disabled={!incomeTaxManual || isSelectedMonthCompleted}
+                />
+              </Col>
+              <Col xs={24} md={6}>
+                <Button
+                  style={{ marginTop: 28 }}
+                  onClick={() => {
+                    setIncomeTaxManual(false);
+                    setIncomeTaxOverride(null);
+                  }}
+                  disabled={!incomeTaxManual || isSelectedMonthCompleted}
+                >
+                  Reset to calculated tax
+                </Button>
+              </Col>
+            </Row>
+
             <Divider style={{ margin: "8px 0" }} />
 
             {/* Live Calculation Output Cards */}
@@ -927,9 +1320,9 @@ const HRPayroll = () => {
                   </Card>
                 </Col>
                 <Col xs={12} sm={8} md={4}>
-                  <Card size="small" style={{ background: "#fff1f0" }}>
+                  <Card size="small" style={{ background: incomeTaxManual ? "#fff7e6" : "#fff1f0" }}>
                     <Statistic
-                      title="Income Tax"
+                      title={incomeTaxManual ? "Income Tax (Adjusted)" : "Income Tax"}
                       value={payrollInputs.incomeTax}
                       precision={2}
                       suffix="ETB"
@@ -954,28 +1347,42 @@ const HRPayroll = () => {
             <Divider style={{ margin: "8px 0" }} />
 
             {/* Action Buttons */}
-            <Space style={{ width: "100%", justifyContent: "space-between" }}>
-              <Button
-                type="primary"
-                size="large"
-                onClick={savePayrollRecord}
-                loading={saving}
-                disabled={isSelectedMonthCompleted}
+            <Space style={{ width: "100%", justifyContent: "space-between", flexWrap: "wrap" }}>
+              <Space wrap>
+                <Button
+                  type="primary"
+                  size="large"
+                  onClick={savePayrollRecord}
+                  loading={saving}
+                  disabled={isSelectedMonthCompleted}
+                >
+                  Save Payroll Record
+                </Button>
+                <Button size="large" onClick={() => openBackPayModal()} disabled={completedMonthKeys.length === 0}>
+                  Record Back Pay
+                </Button>
+              </Space>
+              <Tooltip
+                title={
+                  !selectedMonthSummary.canCloseMonth && isSelectedMonthActive
+                    ? formatMonthCloseBlockMessage(selectedMonthSummary)
+                    : null
+                }
               >
-                Save Payroll Record
-              </Button>
-              <Button
-                type="primary"
-                danger
-                size="large"
-                onClick={markMonthCompleted}
-                disabled={!isSelectedMonthActive}
-              >
-                Close & Mark Month as Paid
-              </Button>
+                <Button
+                  type="primary"
+                  danger
+                  size="large"
+                  onClick={markMonthCompleted}
+                  disabled={!isSelectedMonthActive || !selectedMonthSummary.canCloseMonth}
+                >
+                  Close & Mark Month as Paid
+                </Button>
+              </Tooltip>
             </Space>
           </Space>
         </Card>
+        </div>
 
         {/* Main Payroll Table */}
         <Card title={`Monthly Payroll Roster — ${selectedMonthLabel}`} bordered={false} style={{ borderRadius: 12 }}>
@@ -985,13 +1392,14 @@ const HRPayroll = () => {
             pagination={false}
             rowKey="id"
             onRow={(record) => ({
-              onClick: () => {
-                setSelectedEmployeeId(record.employeeId);
-                message.info(`Selected ${record.employeeName} for adjustments.`);
-              },
+              onClick: () => handleAdjustRecord(record),
               style: {
                 cursor: "pointer",
-                background: record.employeeId === selectedEmployeeId ? "#e6f4ff" : "inherit",
+                background:
+                  record.id === adjustingRecordId ||
+                  (!adjustingRecordId && record.employeeId === selectedEmployeeId)
+                    ? "#e6f4ff"
+                    : "inherit",
               },
             })}
           />
@@ -1034,11 +1442,19 @@ const HRPayroll = () => {
 
             <Card type="inner" title="3. Employment Income Tax (Proc 979/2016)" style={{ marginBottom: 12 }}>
               <p><strong>Applied Tax Bracket:</strong> {auditEmployeeData.rawCalculations.bracketLabel}</p>
-              <p><strong>Tax Rate:</strong> {auditEmployeeData.rawCalculations.taxRatePercent}%</p>
-              <p><strong>Deduction Constant:</strong> {auditEmployeeData.rawCalculations.taxDeduction.toLocaleString()} ETB</p>
-              <Divider style={{ margin: "8px 0" }} />
-              <p><strong>Formula:</strong> (Taxable Base × Tax Rate) - Deduction</p>
-              <p><strong>Calculation:</strong> ({auditEmployeeData.rawCalculations.taxableIncome.toLocaleString()} × {auditEmployeeData.rawCalculations.taxRatePercent}%) - {auditEmployeeData.rawCalculations.taxDeduction} = <strong>{auditEmployeeData.rawCalculations.incomeTax.toLocaleString()} ETB</strong></p>
+              <p><strong>Calculated Tax:</strong> {(auditEmployeeData.rawCalculations.calculatedIncomeTax ?? auditEmployeeData.rawCalculations.incomeTax).toLocaleString()} ETB</p>
+              {auditEmployeeData.incomeTaxManual && (
+                <p><strong>Company-Adjusted Tax:</strong> {auditEmployeeData.rawCalculations.incomeTax.toLocaleString()} ETB</p>
+              )}
+              {!auditEmployeeData.incomeTaxManual && (
+                <>
+                  <p><strong>Tax Rate:</strong> {auditEmployeeData.rawCalculations.taxRatePercent}%</p>
+                  <p><strong>Deduction Constant:</strong> {auditEmployeeData.rawCalculations.taxDeduction.toLocaleString()} ETB</p>
+                  <Divider style={{ margin: "8px 0" }} />
+                  <p><strong>Formula:</strong> (Taxable Base × Tax Rate) - Deduction</p>
+                  <p><strong>Calculation:</strong> ({auditEmployeeData.rawCalculations.taxableIncome.toLocaleString()} × {auditEmployeeData.rawCalculations.taxRatePercent}%) - {auditEmployeeData.rawCalculations.taxDeduction} = <strong>{auditEmployeeData.rawCalculations.incomeTax.toLocaleString()} ETB</strong></p>
+                </>
+              )}
             </Card>
 
             <Card type="inner" title="4. Final Net Salary Summary" style={{ background: "#e6f4ff" }}>
@@ -1050,6 +1466,111 @@ const HRPayroll = () => {
             </Card>
           </div>
         )}
+      </Modal>
+
+      <Modal
+        title={
+          <Space>
+            <Clock color="#1677ff" />
+            <span>Record Back Pay — {selectedEmployee?.name || "Employee"}</span>
+          </Space>
+        }
+        open={backPayModalVisible}
+        onCancel={() => setBackPayModalVisible(false)}
+        onOk={saveBackPayRecord}
+        okText="Save Back Pay as Paid"
+        confirmLoading={saving}
+        width={720}
+      >
+        <Space direction="vertical" size="middle" style={{ width: "100%", marginTop: 8 }}>
+          <Alert
+            type="info"
+            showIcon
+            message="Back pay settles salary for a closed work month without reopening that period."
+            description={`Payment will be recorded in the current open month (${monthLabel(activeMonthKey, useEthiopianCalendar)}).`}
+          />
+          <Row gutter={[16, 16]}>
+            <Col xs={24} md={12}>
+              <label style={{ display: "block", marginBottom: 6, fontWeight: 600 }}>Work Month (closed)</label>
+              <Select
+                style={{ width: "100%" }}
+                value={backPayWorkMonth}
+                onChange={setBackPayWorkMonth}
+                options={backPayMonthOptions}
+                placeholder="Select closed month"
+              />
+            </Col>
+            <Col xs={24} md={12}>
+              <label style={{ display: "block", marginBottom: 6, fontWeight: 600 }}>Paid In (current month)</label>
+              <Select
+                style={{ width: "100%" }}
+                value={activeMonthKey}
+                disabled
+                options={[{ label: monthLabel(activeMonthKey, useEthiopianCalendar), value: activeMonthKey }]}
+              />
+            </Col>
+            <Col xs={24} md={8}>
+              <label style={{ display: "block", marginBottom: 6, fontWeight: 600 }}>Basic Salary (ETB)</label>
+              <InputNumber
+                min={0}
+                value={backPayBasicSalary}
+                style={{ width: "100%" }}
+                onChange={(value) => setBackPayBasicSalary(Number(value) || 0)}
+              />
+            </Col>
+            <Col xs={24} md={8}>
+              <label style={{ display: "block", marginBottom: 6, fontWeight: 600 }}>Taxable Allowances</label>
+              <InputNumber
+                min={0}
+                value={backPayTaxableAllowances}
+                style={{ width: "100%" }}
+                onChange={(value) => setBackPayTaxableAllowances(Number(value) || 0)}
+              />
+            </Col>
+            <Col xs={24} md={8}>
+              <label style={{ display: "block", marginBottom: 6, fontWeight: 600 }}>Non-Taxable Allowances</label>
+              <InputNumber
+                min={0}
+                value={backPayNonTaxableAllowances}
+                style={{ width: "100%" }}
+                onChange={(value) => setBackPayNonTaxableAllowances(Number(value) || 0)}
+              />
+            </Col>
+            <Col xs={24}>
+              <Space wrap align="center">
+                <Switch
+                  checked={backPayIncomeTaxManual}
+                  onChange={(checked) => {
+                    setBackPayIncomeTaxManual(checked);
+                    if (checked) {
+                      setBackPayIncomeTaxOverride(backPayBaseCalc.calculatedIncomeTax ?? backPayBaseCalc.incomeTax);
+                    } else {
+                      setBackPayIncomeTaxOverride(null);
+                    }
+                  }}
+                />
+                <Text strong>Company-adjusted income tax</Text>
+                <Text type="secondary">
+                  Calculated: {(backPayBaseCalc.calculatedIncomeTax ?? backPayBaseCalc.incomeTax).toLocaleString(undefined, { minimumFractionDigits: 2 })} ETB
+                </Text>
+              </Space>
+            </Col>
+            <Col xs={24} md={8}>
+              <label style={{ display: "block", marginBottom: 6, fontWeight: 600 }}>Income Tax (ETB)</label>
+              <InputNumber
+                min={0}
+                value={backPayIncomeTaxManual ? backPayIncomeTaxOverride : backPayCalc.incomeTax}
+                style={{ width: "100%" }}
+                onChange={(value) => setBackPayIncomeTaxOverride(Number(value) || 0)}
+                disabled={!backPayIncomeTaxManual}
+              />
+            </Col>
+            <Col xs={24} md={8}>
+              <label style={{ display: "block", marginBottom: 6, fontWeight: 600 }}>Net Payable (ETB)</label>
+              <InputNumber value={backPayCalc.netSalary} style={{ width: "100%" }} disabled />
+            </Col>
+          </Row>
+        </Space>
       </Modal>
     </div>
   );

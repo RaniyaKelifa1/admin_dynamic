@@ -1,8 +1,9 @@
 import React, { useEffect, useState, useMemo } from "react";
 import { Card, Typography, Table, Tag, Input, message, Space, Form, Modal, Select, Button, DatePicker } from "antd";
+import dayjs from "dayjs";
 import { db } from "../Sales/Components/firebase";
 import { collection, getDocs, addDoc, updateDoc, doc, serverTimestamp, deleteDoc } from "firebase/firestore";
-import { formatDisplayDate, loadHrEmployees, parseDateValue } from "./hrDataService";
+import { formatDisplayDate, loadHrEmployees, loadHrPayrollRecords, employeeHasUnpaidPayroll, parseDateValue } from "./hrDataService";
 
 // Generate and trigger download of a Word-compatible .doc file (HTML format)
 // Generate and trigger download of a Word-compatible .doc file (HTML format)
@@ -283,16 +284,31 @@ const HREmployees = () => {
 
   const handleStatusChange = async (value, record) => {
     const updatedStatus = value || "Inactive";
+    const now = new Date();
+    const updates = {
+      status: updatedStatus,
+      endDate: updatedStatus === "Inactive" ? now : null,
+      updatedAt: serverTimestamp(),
+    };
+
     try {
-      await updateDoc(doc(db, "Employees", record.id), {
-        status: updatedStatus,
-      });
+      await updateDoc(doc(db, "Employees", record.id), updates);
       setEmployees((current) =>
         current.map((item) =>
-          item.id === record.id ? { ...item, status: updatedStatus } : item
+          item.id === record.id
+            ? {
+                ...item,
+                status: updatedStatus,
+                endDate: updatedStatus === "Inactive" ? now : null,
+              }
+            : item
         )
       );
-      message.success("Status updated");
+      if (updatedStatus === "Inactive") {
+        message.success("Employee marked inactive. Use payroll back pay if they return with unpaid salary.");
+      } else {
+        message.success("Employee reactivated");
+      }
     } catch (error) {
       console.error("Error updating status:", error);
       message.error("Could not update status");
@@ -340,15 +356,27 @@ const HREmployees = () => {
       phoneNumber: record.phoneNumber,
       defaultSalary: record.defaultSalary || record.basicSalary || 12000,
       status: record.status || "Active",
+      endDate: record.endDate ? dayjs(parseDateValue(record.endDate)) : null,
     });
     setIsModalVisible(true);
   };
 
   const handleDeleteEmployee = async (record) => {
-    const confirmed = window.confirm(`Delete employee ${record.name}? This action cannot be undone.`);
-    if (!confirmed) return;
     setSaving(true);
     try {
+      const payrollRecords = await loadHrPayrollRecords();
+      if (employeeHasUnpaidPayroll(record.id, payrollRecords)) {
+        message.error(
+          "Cannot delete this employee while unpaid payroll exists. Mark them Inactive and use payroll back pay when they return."
+        );
+        return;
+      }
+
+      const confirmed = window.confirm(
+        `Delete employee ${record.name}? Prefer marking Inactive to preserve payroll history. This action cannot be undone.`
+      );
+      if (!confirmed) return;
+
       await deleteDoc(doc(db, "Employees", record.id));
       setEmployees((current) => current.filter((e) => e.id !== record.id));
       message.success("Employee removed");
@@ -434,7 +462,17 @@ const HREmployees = () => {
       };
 
       if (isEditing && editingEmployeeId) {
-        const updatePayload = Object.fromEntries(Object.entries(payload).filter(([k, v]) => v !== undefined));
+        const updatePayload = Object.fromEntries(
+          Object.entries({
+            ...payload,
+            endDate:
+              values.status === "Inactive"
+                ? values.endDate
+                  ? values.endDate.toDate()
+                  : new Date()
+                : null,
+          }).filter(([k, v]) => v !== undefined)
+        );
         await updateDoc(doc(db, "Employees", editingEmployeeId), updatePayload);
 
         setEmployees((current) => current.map((emp) => (emp.id === editingEmployeeId ? { ...emp, ...updatePayload } : emp)));
@@ -520,6 +558,15 @@ const HREmployees = () => {
       },
     },
     {
+      title: "Left",
+      dataIndex: "endDate",
+      key: "endDate",
+      render: (_, record) => {
+        if (record.status !== "Inactive") return "—";
+        return formatDisplayDate(record.endDate) || "—";
+      },
+    },
+    {
       title: "Status",
       dataIndex: "status",
       key: "status",
@@ -598,6 +645,15 @@ const HREmployees = () => {
           </Form.Item>
           <Form.Item label="Status" name="status" initialValue="Active">
             <Select options={[{ label: "Active", value: "Active" }, { label: "Inactive", value: "Inactive" }]} />
+          </Form.Item>
+          <Form.Item noStyle shouldUpdate={(prev, curr) => prev.status !== curr.status}>
+            {({ getFieldValue }) =>
+              getFieldValue("status") === "Inactive" ? (
+                <Form.Item label="End Date" name="endDate">
+                  <DatePicker style={{ width: "100%" }} />
+                </Form.Item>
+              ) : null
+            }
           </Form.Item>
           <Form.Item>
             <Button type="primary" htmlType="submit" loading={saving}>

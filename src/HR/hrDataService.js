@@ -47,6 +47,7 @@ const normalizeEmployeeRecord = (docId, data = {}, sourceCollection = "Employees
     defaultSalary: data.defaultSalary ?? data.basicSalary ?? data.salary ?? 12000,
     basicSalary: data.basicSalary ?? data.defaultSalary ?? data.salary ?? 12000,
     creationTime,
+    endDate: parseDateValue(data.endDate),
     joined,
     originalDepartment: data.department || data.teamName || data.office || data.team || "",
     ...data,
@@ -178,6 +179,7 @@ export const loadHrDepartments = async () => {
 
 export const loadHrPayrollRecords = async () => {
   const normalizePayroll = (docId, data = {}, collectionName) => ({
+    ...data,
     id: docId,
     key: docId,
     sourceCollection: collectionName,
@@ -187,7 +189,13 @@ export const loadHrPayrollRecords = async () => {
     taxableAllowances: data.taxableAllowances ?? data.taxableAllowance ?? 0,
     nonTaxableAllowances: data.nonTaxableAllowances ?? data.nonTaxableAllowance ?? 0,
     status: data.status || "Pending",
-    ...data,
+    recordType: data.recordType || "regular",
+    workMonthKey: data.workMonthKey || data.monthKey || data.period || data.month || "",
+    paidInMonthKey: data.paidInMonthKey || "",
+    incomeTaxManual: Boolean(data.incomeTaxManual),
+    incomeTaxOverride: data.incomeTaxOverride ?? null,
+    incomeTax: data.incomeTax ?? null,
+    calculatedIncomeTax: data.calculatedIncomeTax ?? null,
   });
 
   return loadRecordsFromCollections(
@@ -212,3 +220,111 @@ export const loadHrPayrollMonths = async () => {
     normalizeMonth
   );
 };
+
+export const isEmployeeActive = (employee) => {
+  const statusValue = employee?.status;
+  if (typeof statusValue === "boolean") {
+    return statusValue;
+  }
+  return String(statusValue || "Active").toLowerCase() !== "inactive";
+};
+
+const isMonthClosed = (monthKey, monthStatusMap = {}) => {
+  const entry = monthStatusMap[monthKey];
+  const status = typeof entry === "string" ? entry : entry?.status;
+  return status === "Paid";
+};
+
+export const getMonthPaymentSummary = (monthKey, employees, payrollRecords) => {
+  const monthRecords = payrollRecords.filter(
+    (record) => record.monthKey === monthKey && record.recordType !== "arrears"
+  );
+  const recordByEmployee = Object.fromEntries(monthRecords.map((record) => [record.employeeId, record]));
+
+  const unpaid = [];
+  const missing = [];
+  let paidCount = 0;
+  let requiredCount = 0;
+
+  for (const employee of employees) {
+    const record = recordByEmployee[employee.id];
+    const active = isEmployeeActive(employee);
+
+    if (!active) {
+      if (record && (record.status || "Pending") !== "Paid") {
+        requiredCount += 1;
+        unpaid.push({ employee, record, reason: "inactive-unpaid" });
+      }
+      continue;
+    }
+
+    requiredCount += 1;
+
+    if (!record) {
+      missing.push(employee);
+      continue;
+    }
+
+    if ((record.status || "Pending") !== "Paid") {
+      unpaid.push({ employee, record });
+      continue;
+    }
+
+    paidCount += 1;
+  }
+
+  return {
+    canCloseMonth: unpaid.length === 0 && missing.length === 0 && requiredCount > 0,
+    unpaid,
+    missing,
+    paidCount,
+    totalCount: requiredCount,
+    activeEmployeeCount: employees.filter(isEmployeeActive).length,
+    inactiveBlockingCount: unpaid.filter((entry) => entry.reason === "inactive-unpaid").length,
+  };
+};
+
+export const formatMonthCloseBlockMessage = (summary) => {
+  const remaining = [
+    ...summary.missing.map((employee) => `${employee.name} (no payroll record)`),
+    ...summary.unpaid.map(({ employee, record }) => `${employee.name} (${record.status || "Pending"})`),
+  ];
+
+  return `Cannot close month: ${summary.paidCount}/${summary.totalCount} required employees paid. Remaining: ${remaining.join(", ")}`;
+};
+
+export const getEmployeePendingArrears = (employeeId, payrollRecords, monthStatusMap) => {
+  return payrollRecords.filter((record) => {
+    if (record.employeeId !== employeeId) return false;
+    if ((record.status || "Pending") === "Paid") return false;
+
+    const workMonth = record.workMonthKey || record.monthKey;
+    if (!isMonthClosed(workMonth, monthStatusMap)) return false;
+
+    return true;
+  });
+};
+
+export const getAllPendingArrears = (employees, payrollRecords, monthStatusMap) => {
+  const arrearsByEmployee = {};
+
+  employees.forEach((employee) => {
+    const pending = getEmployeePendingArrears(employee.id, payrollRecords, monthStatusMap);
+    if (pending.length > 0) {
+      arrearsByEmployee[employee.id] = {
+        employee,
+        records: pending,
+      };
+    }
+  });
+
+  return arrearsByEmployee;
+};
+
+export const employeeHasUnpaidPayroll = (employeeId, payrollRecords) => {
+  return payrollRecords.some(
+    (record) => record.employeeId === employeeId && (record.status || "Pending") !== "Paid"
+  );
+};
+
+export const buildBackPayRecordId = (employeeId, workMonthKey) => `pay-${employeeId}-${workMonthKey}`;
